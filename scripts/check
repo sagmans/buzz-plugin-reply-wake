@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Repository checks for this plugin, beyond the generic ones in .githooks/lib.
+#
+# Why: Buzz runs plugin.js unsandboxed inside the desktop app and installs it
+# straight from this repository, so a syntax error, a broken manifest, a
+# behavior regression or a leaked private value ships the moment someone
+# installs from Git. The git hooks call this script (pre-commit: --quick on
+# the staged tree; pre-push: full, on every pushed commit), and contributors
+# can run it by hand: `scripts/check` or `scripts/check --quick`.
+#
+# Usage: scripts/check [--quick] [DIR]
+#   DIR is a tree with this repository's layout (default: the repository top).
+#   A git worktree is judged by its tracked files only; any other directory
+#   (the exported index at pre-commit) by every regular file in it.
+#
+# Every check fails closed: a missing tool, a tool error or a finding exits 1.
+# A check whose input is absent from DIR (for example an older commit without
+# the plugin) is skipped, because there is nothing for it to judge.
+set -euo pipefail
+
+SELF_DIR="$(cd "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+REPO_TOP="$(cd "$SELF_DIR/.." && pwd -P)"
+HOOK_LIB="$REPO_TOP/.githooks/lib"
+# shellcheck source-path=SCRIPTDIR source=../.githooks/lib/tools.sh
+. "$HOOK_LIB/tools.sh"
+
+CHECK=repo-check
+PLUGIN_DIR=plugin
+MANIFEST="$PLUGIN_DIR/manifest.json"
+PLUGIN_JS="$PLUGIN_DIR/plugin.js"
+SMOKE=scripts/smoke.mjs
+# Buzz manifest limits (buzz-app crates/plugin-manager): id shape and length,
+# description size in bytes.
+MANIFEST_ID_RE='^[a-z][a-z0-9.-]{0,79}$'
+MANIFEST_DESCRIPTION_MAX_BYTES=280
+MANIFEST_API_VERSION=1
+# Complexity limits match the generic changed-function check, applied here
+# to every function so old code cannot drift past them unnoticed.
+LIZARD_MAX_CCN=15
+LIZARD_MAX_LENGTH=100
+# Network scanners must not freeze a push on a dead connection.
+SEMGREP_TIMEOUT_SECONDS=300
+TRIVY_TIMEOUT_SECONDS=300
+SEMGREP_REGISTRY_CONFIG=p/javascript
+# Minimum versions: the releases these flags and rule sets were verified with.
+NODE_MIN_VERSION=20.0.0
+SHELLCHECK_MIN_VERSION=0.10.0
+SHFMT_MIN_VERSION=3.8.0
+MARKDOWNLINT_MIN_VERSION=0.23.2
+LIZARD_MIN_VERSION=1.24.1
+SEMGREP_MIN_VERSION=1.182.0
+TRIVY_MIN_VERSION=0.60.0
+# Generic shapes of private data that must never reach a public plugin
+# repository. Real names and handles are deliberately not listed: the guard
+# itself is public. Bracketed first letters keep each pattern from matching
+# its own source text.
+PRIVATE_PATTERNS=(
+	'\.tail[0-9a-f]+\.ts\.net'
+	'/[U]sers/[^/[:space:]]+/'
+	'/[h]ome/[^/[:space:]]+/'
+	'[~]/\.buzz'
+	'[~]/[s]ource/'
+	'npub1[02-9ac-hj-np-z]{20,}'
+	'nsec1[02-9ac-hj-np-z]{20,}'
+	'(^|[^0-9a-f])[0-9a-f]{64}([^0-9a-f]|$)'
+	'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+	'[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+)
+# Email-shaped text that is public by design: RFC 2606 example domains.
+PRIVATE_ALLOWED_RE='@example\.(com|org|net)'
+# Files copied from the hook template stay byte-identical to it, so their
+# style is the template's concern; repo-owned shell lives elsewhere.
+TEMPLATE_SHELL_RE='^(\.githooks/[^/]+|\.githooks/lib/.*|scripts/setup-hooks)$'
+
+quick=0
+if [ "${1:-}" = --quick ]; then
+	quick=1
+	shift
+fi
+target="$(cd "${1:-$REPO_TOP}" && pwd -P)"
+cd "$target"
+
+fail() {
+	echo >&2 "❌ $CHECK: $*"
+	exit 1
+}
+
+# Print the files to judge, NUL-separated, relative to the target.
+list_files() {
+	if [ "$(git rev-parse --show-toplevel 2>/dev/null || true)" = "$target" ]; then
+		git ls-files -z
+	else
+		find . -type f -print0
+	fi
+}
+
+files=()
+while IFS= read -r -d '' path; do
+	files+=("${path#./}")
+done < <(list_files)
+
+has_file() {
+	local want="$1" path
+	for path in "${files[@]}"; do
+		[ "$path" = "$want" ] && return 0
+	done
+	return 1
+}
+
+# Every tracked JS file must parse, so the Buzz loader never meets a syntax
+# error that a reviewer missed.
+check_js_syntax() {
+	local path seen=0
+	for path in "${files[@]}"; do
+		case "$path" in *.js | *.mjs | *.cjs) ;; *) continue ;; esac
+		[ "$seen" -eq 1 ] || require_tool "$CHECK" node "$NODE_MIN_VERSION" 'install Node.js (https://nodejs.org)' node --version
+		seen=1
+		node --check "$path" || fail "node --check failed: $path"
+	done
+}
+
+# Buzz rejects the whole install for a bad manifest; catch it before it ships.
+check_manifest() {
+	has_file "$MANIFEST" || return 0
+	has_file "$PLUGIN_JS" || fail "$MANIFEST exists but $PLUGIN_JS is missing"
+	node --input-type=module - "$MANIFEST" "$MANIFEST_ID_RE" "$MANIFEST_DESCRIPTION_MAX_BYTES" "$MANIFEST_API_VERSION" <<'NODE' || fail "$MANIFEST is invalid"
+import { readFileSync } from "node:fs";
+const [path, idPattern, maxBytes, apiVersion] = process.argv.slice(2);
+const manifest = JSON.parse(readFileSync(path, "utf8"));
+const problems = [];
+if (!new RegExp(idPattern).test(manifest.id ?? "")) problems.push(`id ${JSON.stringify(manifest.id)} does not match ${idPattern}`);
+if (typeof manifest.name !== "string" || !manifest.name.trim()) problems.push("name is empty");
+if (manifest.apiVersion !== Number(apiVersion)) problems.push(`apiVersion is not ${apiVersion}`);
+const bytes = Buffer.byteLength(manifest.description ?? "", "utf8");
+if (bytes < 1 || bytes > Number(maxBytes)) problems.push(`description is ${bytes} bytes (1-${maxBytes})`);
+if (manifest.host !== undefined) problems.push("host grants are not expected: this plugin needs no native access");
+for (const problem of problems) console.error(`  ${path}: ${problem}`);
+process.exit(problems.length ? 1 : 0);
+NODE
+}
+
+# Repo-owned shell scripts: lint for bugs, and one format so diffs stay small.
+check_shell() {
+	local path shells=() first
+	for path in "${files[@]}"; do
+		[[ "$path" =~ $TEMPLATE_SHELL_RE ]] && continue
+		first=''
+		IFS= read -r first <"$path" || true
+		case "$path:$first" in *.sh:* | *':#!'*sh) shells+=("$path") ;; esac
+	done
+	[ "${#shells[@]}" -gt 0 ] || return 0
+	require_tool "$CHECK" shellcheck "$SHELLCHECK_MIN_VERSION" 'install shellcheck (https://www.shellcheck.net)' shellcheck --version
+	require_tool "$CHECK" shfmt "$SHFMT_MIN_VERSION" 'install shfmt (https://github.com/mvdan/sh)' shfmt --version
+	shellcheck --external-sources --severity=style "${shells[@]}" || fail "shellcheck found problems"
+	shfmt --diff "${shells[@]}" || fail "shfmt would reformat these files; run: shfmt --write <file>"
+}
+
+# Fail on any private-data shape; print path:line so it is fixed in one pass.
+check_private_data() {
+	local pattern hits found=0
+	[ "${#files[@]}" -gt 0 ] || return 0
+	for pattern in "${PRIVATE_PATTERNS[@]}"; do
+		hits="$(grep -n -I -E -- "$pattern" "${files[@]}" | grep -v -E -- "$PRIVATE_ALLOWED_RE" || true)"
+		if [ -n "$hits" ]; then
+			echo >&2 "❌ $CHECK: private-data pattern '$pattern' matched:"
+			printf '%s\n' "$hits" | sed 's/^/   /' >&2
+			found=1
+		fi
+	done
+	[ "$found" -eq 0 ] || fail "remove the private data above (use neutral words such as \"the user\" or example.com)"
+}
+
+# Behavior must stay what the README promises; the smoke script drives the
+# real plugin.js with a fake Buzz context.
+check_smoke() {
+	has_file "$SMOKE" || return 0
+	has_file "$PLUGIN_JS" || fail "$SMOKE exists but $PLUGIN_JS is missing"
+	node "$SMOKE" "$PLUGIN_JS" || fail "smoke scenarios failed"
+}
+
+# The generic hook lints only staged Markdown; at push the whole tree is judged.
+check_markdown() {
+	local path docs=()
+	for path in "${files[@]}"; do
+		case "$path" in *.md | *.MD | *.markdown) docs+=("$path") ;; esac
+	done
+	[ "${#docs[@]}" -gt 0 ] || return 0
+	require_tool "$CHECK" markdownlint-cli2 "$MARKDOWNLINT_MIN_VERSION" 'install markdownlint-cli2' markdownlint-cli2 --help
+	markdownlint-cli2 --config "$HOOK_LIB/markdownlint.jsonc" -- "${docs[@]}" || fail "markdownlint found problems"
+}
+
+check_complexity() {
+	local path sources=()
+	for path in "${files[@]}"; do
+		case "$path" in *.js | *.mjs | *.cjs) sources+=("$path") ;; esac
+	done
+	[ "${#sources[@]}" -gt 0 ] || return 0
+	require_tool "$CHECK" lizard "$LIZARD_MIN_VERSION" 'install lizard (pipx install lizard)' lizard --version
+	lizard --CCN "$LIZARD_MAX_CCN" --length "$LIZARD_MAX_LENGTH" --warnings_only "${sources[@]}" ||
+		fail "lizard: a function is above CCN $LIZARD_MAX_CCN or $LIZARD_MAX_LENGTH lines"
+}
+
+# The registry JavaScript rule set adds browser-specific rules (DOM XSS,
+# insecure randomness, ...) to the generic hook's vendored offline rules.
+check_semgrep() {
+	local path sources=()
+	for path in "${files[@]}"; do
+		case "$path" in *.js | *.mjs | *.cjs) sources+=("$path") ;; esac
+	done
+	[ "${#sources[@]}" -gt 0 ] || return 0
+	require_tool "$CHECK" semgrep "$SEMGREP_MIN_VERSION" 'install semgrep (https://semgrep.dev)' semgrep --version
+	run_with_timeout "$SEMGREP_TIMEOUT_SECONDS" semgrep scan --config "$SEMGREP_REGISTRY_CONFIG" \
+		--metrics=off --disable-version-check --error --quiet -- "${sources[@]}" ||
+		fail "semgrep $SEMGREP_REGISTRY_CONFIG failed (finding, network error or timeout)"
+}
+
+# Second, independent secret engine next to gitleaks, plus misconfiguration
+# rules for any workflow or container file a later change adds.
+check_trivy() {
+	require_tool "$CHECK" trivy "$TRIVY_MIN_VERSION" 'install trivy (https://trivy.dev)' trivy --version
+	run_with_timeout "$TRIVY_TIMEOUT_SECONDS" trivy fs --quiet --scanners secret,misconfig \
+		--skip-dirs .git --exit-code 1 --timeout "${TRIVY_TIMEOUT_SECONDS}s" . ||
+		fail "trivy found secrets or misconfigurations (or failed to run)"
+}
+
+check_js_syntax
+check_manifest
+check_shell
+check_private_data
+if [ "$quick" -eq 1 ]; then
+	exit 0
+fi
+check_smoke
+check_markdown
+check_complexity
+check_semgrep
+check_trivy
+echo "✅ $CHECK: all checks passed for $target"

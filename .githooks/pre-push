@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# pre-push: generic DCO, signature and secret checks on every pushed commit,
+# then the repo's .githooks/pre-push.d/* (lint, tests). Git sends the ref
+# lines once on stdin, so they are kept in a file for every check to read.
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=lib/run-local.sh
+. "$(dirname -- "${BASH_SOURCE[0]}")/lib/run-local.sh"
+
+HOOK_STDIN_FILE="$(mktemp "${TMPDIR:-/tmp}/pre-push-refs.XXXXXX")"
+export HOOK_STDIN_FILE
+trap 'rm -f -- "$HOOK_STDIN_FILE"' EXIT
+cat >"$HOOK_STDIN_FILE"
+
+# Every check judges the same commits: the remote and its default-branch
+# base are resolved once here (one network round trip) for push.sh and for
+# pushed_shas in the repo checks.
+# shellcheck source-path=SCRIPTDIR source=lib/helpers.sh
+. "$HOOK_HELPERS"
+export HOOK_PUSH_REMOTE="$1"
+HOOK_PUSH_BASE_SHA="$(push_default_base "$1")"
+export HOOK_PUSH_BASE_SHA
+
+"$CHECKS_DIR/push.sh" "$@" <"$HOOK_STDIN_FILE"
+run_local pre-push "$@"

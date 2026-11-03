@@ -1,0 +1,7 @@
+# macOS Finder metadata
+.DS_Store
+# Local tool installs; this repository ships no npm dependencies
+node_modules/
+# Throwaway files from local dogfood runs
+.scratch/
+*.log

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Full repo checks (smoke scenarios, Markdown, complexity, semgrep registry
+# rules, trivy) on every pushed commit, so no commit in the published history
+# is broken or carries private data. Uses this checkout's scripts/check, not
+# the pushed commit's copy, so a commit cannot weaken the checks that judge it.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. "${HOOK_HELPERS:?run from .githooks (scripts/setup-hooks)}"
+
+check="$(git rev-parse --show-toplevel)/scripts/check"
+shas=$(pushed_shas <"$HOOK_STDIN_FILE") || exit 1
+for sha in $shas; do
+	echo "repo-check: commit ${sha:0:12}"
+	at_sha "$sha" "$check" || exit 1
+done

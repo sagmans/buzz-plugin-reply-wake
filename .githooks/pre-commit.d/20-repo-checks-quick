@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Fast repo checks (JS syntax, manifest, shell lint, private-data guard) on
+# exactly what is being committed. The staged index is exported to a temporary
+# tree, so a partly staged file is judged by its staged half and `commit -a`
+# or `commit <paths>` are judged by the index git chose.
+set -euo pipefail
+
+# shellcheck source=/dev/null
+. "${HOOK_HELPERS:?run from .githooks (scripts/setup-hooks)}"
+
+top="$(git rev-parse --show-toplevel)"
+tmp="$(mktemp -d "${TMPDIR:-/tmp}/hook-repo-quick.XXXXXX")"
+# Only the mktemp directory this run created, never a computed parent.
+cleanup() {
+	case "$tmp" in
+	*/hook-repo-quick.*) rm -rf -- "$tmp" ;;
+	esac
+}
+trap cleanup EXIT
+
+staged_git checkout-index --all --prefix="$tmp/"
+"$top/scripts/check" --quick "$tmp"

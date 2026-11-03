@@ -1,0 +1,56 @@
+#!/bin/sh
+# Turn on this repository's git hooks for this clone and all its worktrees.
+# Git never runs hooks that ship inside a repository until the clone opts
+# in, so every contributor runs this once after cloning. It only sets the
+# local core.hooksPath; it needs no other repo or tool to do so.
+# Idempotent: a second run changes nothing and says so.
+# Copied from the shared hook template.
+set -eu
+
+HOOKS_DIR=.githooks
+HOOK_NAMES='pre-commit pre-merge-commit prepare-commit-msg commit-msg pre-push'
+# Scanners the generic checks call; each check blocks when it needs a missing
+# one, so warn now instead of at the first commit or push that needs it.
+SCANNERS='gitleaks markdownlint-cli2 actionlint zizmor osv-scanner semgrep lizard'
+
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+if [ ! -d "$HOOKS_DIR" ]; then
+	echo "setup-hooks: $top/$HOOKS_DIR is missing" >&2
+	exit 1
+fi
+
+# A hook without the exec bit is ignored by git, which would pass silently.
+for name in $HOOK_NAMES; do
+	if [ -f "$HOOKS_DIR/$name" ] && [ ! -x "$HOOKS_DIR/$name" ]; then
+		echo "setup-hooks: $HOOKS_DIR/$name is not executable (git would skip it)" >&2
+		exit 1
+	fi
+done
+
+current=$(git config --local --get core.hooksPath || true)
+if [ "$current" = "$HOOKS_DIR" ]; then
+	echo "setup-hooks: core.hooksPath is already $HOOKS_DIR (no change)"
+else
+	git config --local core.hooksPath "$HOOKS_DIR"
+	echo "setup-hooks: set local core.hooksPath=$HOOKS_DIR (was: ${current:-unset})"
+fi
+
+# A per-worktree value wins over the local one and would hide these hooks.
+if [ "$(git config --type=bool --get extensions.worktreeConfig 2>/dev/null || true)" = true ]; then
+	wt=$(git config --worktree --get core.hooksPath || true)
+	if [ -n "$wt" ] && [ "$wt" != "$HOOKS_DIR" ]; then
+		echo "setup-hooks: warning: worktree core.hooksPath=$wt overrides $HOOKS_DIR here" >&2
+	fi
+fi
+
+for scanner in $SCANNERS; do
+	if ! command -v "$scanner" >/dev/null 2>&1; then
+		echo "setup-hooks: warning: $scanner not found; the checks that need it will block until it is installed (see .githooks/lib/checks)" >&2
+	fi
+done
+active=''
+for name in $HOOK_NAMES; do
+	[ -x "$HOOKS_DIR/$name" ] && active="$active $name"
+done
+echo "setup-hooks: active hooks:${active:- none}"
