@@ -9,7 +9,10 @@
 # can run it by hand: `scripts/check` or `scripts/check --quick`.
 #
 # Usage: scripts/check [--quick] [DIR]
-#   DIR is a tree with this repository's layout (default: the repository top).
+#   DIR is a tree with this repository's layout. Default: the top of the git
+#   worktree that holds the working directory, else this script's checkout.
+#   The pre-push hook relies on this: it runs this checkout's script inside a
+#   temporary worktree of each pushed commit, and that tree is the one to judge.
 #   A git worktree is judged by its tracked files only; any other directory
 #   (the exported index at pre-commit) by every regular file in it.
 #
@@ -77,7 +80,8 @@ if [ "${1:-}" = --quick ]; then
 	quick=1
 	shift
 fi
-target="$(cd "${1:-$REPO_TOP}" && pwd -P)"
+default_target="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$REPO_TOP")"
+target="$(cd "${1:-$default_target}" && pwd -P)"
 cd "$target"
 
 fail() {
