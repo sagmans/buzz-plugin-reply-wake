@@ -1,0 +1,13 @@
+{
+  "id": "sagmans.reply-wake",
+  "name": "Reply wake",
+  "apiVersion": 1,
+  "description": "Your untagged thread message reaches your agent: the tag is added at send, with a wake fallback. Target: replied agent, else last agent.",
+  "discovery": {
+    "category": "agent-tools",
+    "tags": [
+      "Mentions",
+      "Threads"
+    ]
+  }
+}
