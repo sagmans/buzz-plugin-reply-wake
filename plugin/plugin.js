@@ -11,17 +11,19 @@
 //      went out untagged (for example from the mobile app, which runs no
 //      plugins) wakes the agent through ctx.agents.wake. Buzz shows no
 //      activity row for plugin wakes, so this layer has no UI feedback.
-// Target: the agent whose message the user replies to ("Reply" mode), else
-// the last agent that wrote in the thread.
+// Target (default rule): the agent whose message the user replies to ("Reply"
+// mode), else the last agent that wrote in the thread.
 // Only agents that this app runs for the signed-in user are tagged or woken,
 // so a message never reaches another person's agent.
+// Which target rule applies and whether each layer runs are personal habits,
+// so they are device-local user settings (Settings > Plugins > Reply wake).
 //
 // Known limitation: Buzz gives composer tools the thread root, not the message
 // a draft replies to. Layer 1 therefore finds the "Reply" target by the author
 // name the composer shows; layer 2 reads the real parent from the sent tags.
 
 // Cordis starts apply() only after these host services exist.
-export const inject = ["react", "pages", "relay", "agents", "conversation"];
+export const inject = ["react", "pages", "relay", "agents", "conversation", "settingsCards"];
 
 // Stream chat messages (NIP-29 kind 9): what thread composers and agents write.
 const CHAT_KIND = 9;
@@ -52,6 +54,51 @@ const RULE = Object.freeze({ REPLY: "reply", LAST_AGENT: "last agent" });
 const LAYER = Object.freeze({ TAG: "tag", WAKE: "wake" });
 const TOOL = Object.freeze({ id: "send-tag", title: "Reply wake" });
 const PAGE = Object.freeze({ id: "activity", title: "Reply wake" });
+// Account-level card: the settings belong to this device, not to one community.
+const SETTINGS_CARD = Object.freeze({ id: "settings", title: "Reply wake", group: "Plugins" });
+
+// ---- Settings constants ---------------------------------------------------------
+
+// The host has no plugin storage API, so settings live in the WebView's
+// localStorage. The version suffix lets a later shape migrate old values.
+const SETTINGS_STORAGE_KEY = "sagmans.reply-wake.settings.v1";
+// Which agent an untagged thread message is for.
+const TARGET_RULE = Object.freeze({
+  REPLY_THEN_LAST: "reply-then-last",
+  REPLY_ONLY: "reply-only",
+  LAST_ONLY: "last-only",
+});
+const TARGET_RULE_OPTIONS = Object.freeze([
+  {
+    value: TARGET_RULE.REPLY_THEN_LAST,
+    label: "Replied agent, else last agent",
+    description: "Reply to an agent's message: that agent. Plain thread message: the last agent in the thread.",
+  },
+  {
+    value: TARGET_RULE.REPLY_ONLY,
+    label: "Replied agent only",
+    description: "Only a Reply to an agent's message reaches that agent. Plain thread messages stay untagged.",
+  },
+  {
+    value: TARGET_RULE.LAST_ONLY,
+    label: "Last agent only",
+    description: "Every untagged thread message reaches the last agent in the thread, also in Reply mode.",
+  },
+]);
+// Defaults keep the behavior the plugin had before settings existed.
+const DEFAULT_SETTINGS = Object.freeze({
+  sendTag: true,
+  wakeFallback: true,
+  targetRule: TARGET_RULE.REPLY_THEN_LAST,
+});
+// Allowlist: a saved value is used only when its validator accepts it.
+const SETTING_VALIDATORS = Object.freeze({
+  sendTag: (value) => typeof value === "boolean",
+  wakeFallback: (value) => typeof value === "boolean",
+  targetRule: (value) => Object.values(TARGET_RULE).includes(value),
+});
+// Saved values are shown in messages; a long one must not flood the card.
+const MAX_VALUE_PREVIEW = 40;
 
 // ---- Shared event helpers -----------------------------------------------------
 
@@ -141,6 +188,122 @@ function createSeenOnce(max) {
   };
 }
 
+// ---- Settings ---------------------------------------------------------------------
+
+// A settings read or write failed; `operation` and `key` say which, `cause` why.
+class ReplyWakeSettingsError extends Error {
+  constructor(message, { operation, cause } = {}) {
+    super(message, { cause });
+    this.name = "ReplyWakeSettingsError";
+    this.operation = operation;
+    this.key = SETTINGS_STORAGE_KEY;
+  }
+}
+
+function preview(value) {
+  const text = JSON.stringify(value) ?? String(value);
+  return text.length > MAX_VALUE_PREVIEW ? `${text.slice(0, MAX_VALUE_PREVIEW)}…` : text;
+}
+
+// Saved text -> settings. Never throws: each invalid part falls back to its
+// default and is reported, so a damaged value cannot stop the plugin.
+function parseSettings(raw) {
+  if (raw === null || raw === undefined) return { settings: DEFAULT_SETTINGS, problems: [] };
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    return { settings: DEFAULT_SETTINGS, problems: [`Saved settings are not JSON (${errorText(error)}); defaults apply.`] };
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return { settings: DEFAULT_SETTINGS, problems: ["Saved settings are not an object; defaults apply."] };
+  const settings = { ...DEFAULT_SETTINGS };
+  const problems = [];
+  for (const [key, valid] of Object.entries(SETTING_VALIDATORS)) {
+    if (!Object.hasOwn(value, key)) continue;
+    if (valid(value[key])) settings[key] = value[key];
+    else problems.push(`Saved ${key} ${preview(value[key])} is not valid; default ${preview(DEFAULT_SETTINGS[key])} applies.`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!Object.hasOwn(SETTING_VALIDATORS, key)) problems.push(`Unknown saved setting ${preview(key)} is ignored.`);
+  }
+  return { settings: Object.freeze(settings), problems };
+}
+
+// The WebView's localStorage, or undefined where the host blocks it.
+function deviceStorage() {
+  try {
+    return globalThis.localStorage ?? undefined;
+  } catch (error) {
+    console.warn(`${LOG_PREFIX} device storage unavailable`, { key: SETTINGS_STORAGE_KEY, error });
+    return undefined;
+  }
+}
+
+// Current settings for the layers (read at each send and wake, so a change
+// applies at once) and for the settings card (subscribe/snapshot).
+function createSettingsStore(storage) {
+  const unavailable = "Device storage is unavailable; defaults apply and changes last until restart.";
+  const listeners = new Set();
+  let state = load();
+  function load() {
+    if (!storage) return Object.freeze({ settings: DEFAULT_SETTINGS, problems: [unavailable] });
+    try {
+      return Object.freeze(parseSettings(storage.getItem(SETTINGS_STORAGE_KEY)));
+    } catch (cause) {
+      const error = new ReplyWakeSettingsError("Settings could not be read; defaults apply.", { operation: "read", cause });
+      console.warn(`${LOG_PREFIX} ${error.message}`, { key: error.key, error });
+      return Object.freeze({ settings: DEFAULT_SETTINGS, problems: [error.message] });
+    }
+  }
+  function publish(next) {
+    state = Object.freeze(next);
+    listeners.forEach((listener) => listener());
+  }
+  function write(operation, apply) {
+    if (!storage) return;
+    try {
+      apply();
+    } catch (cause) {
+      throw new ReplyWakeSettingsError(`Settings not saved: device storage refused the ${operation}.`, { operation, cause });
+    }
+  }
+  return {
+    get: () => state.settings,
+    snapshot: () => state,
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    // Another window of the app saved new settings.
+    reload: () => publish(load()),
+    // Validates the whole result before it saves, so storage only ever holds valid settings.
+    update(patch) {
+      const invalid = Object.entries(patch).filter(([key, value]) => !Object.hasOwn(SETTING_VALIDATORS, key) || !SETTING_VALIDATORS[key](value));
+      if (invalid.length) {
+        const list = invalid.map(([key, value]) => `${key} = ${preview(value)}`).join(", ");
+        throw new ReplyWakeSettingsError(`Settings not saved: ${list} is not valid.`, { operation: "validate" });
+      }
+      const settings = Object.freeze({ ...state.settings, ...patch });
+      write("write", () => storage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings)));
+      publish({ settings, problems: storage ? [] : [unavailable] });
+    },
+    reset() {
+      write("removal", () => storage.removeItem(SETTINGS_STORAGE_KEY));
+      publish({ settings: DEFAULT_SETTINGS, problems: storage ? [] : [unavailable] });
+    },
+  };
+}
+
+// Settings saved in another window reach this one through the storage event.
+function followStorage(settings) {
+  const onStorage = (event) => {
+    if (event.key === SETTINGS_STORAGE_KEY || event.key === null) settings.reload();
+  };
+  globalThis.addEventListener?.("storage", onStorage);
+  return () => globalThis.removeEventListener?.("storage", onStorage);
+}
+
 // ---- Layer 1: send-time tag ---------------------------------------------------
 
 // The author name the composer shows in "Reply" mode, or undefined outside it.
@@ -149,14 +312,15 @@ function replyingToName(form) {
   return replying ? replying.textContent.slice(REPLYING_TO.length).trim() : undefined;
 }
 
-// Whom the untagged message is for, or nothing when unsure.
-function pickComposerTarget(agentsHere, replyName) {
+// Whom the untagged message is for under the user's target rule, or nothing when unsure.
+function pickComposerTarget(agentsHere, replyName, targetRule) {
   if (!agentsHere.length) return undefined;
-  if (replyName !== undefined) {
+  if (replyName !== undefined && targetRule !== TARGET_RULE.LAST_ONLY) {
     // "Reply" mode: the shown author name must match exactly one agent of this thread.
     const matches = agentsHere.filter((a) => a.name === replyName);
     return matches.length === 1 ? { ...matches[0], rule: RULE.REPLY } : undefined;
   }
+  if (targetRule === TARGET_RULE.REPLY_ONLY) return undefined;
   const last = agentsHere.reduce((a, b) => (b.key > a.key ? b : a));
   return { ...last, rule: RULE.LAST_AGENT };
 }
@@ -172,9 +336,12 @@ function isSendKey(event, form) {
 }
 
 // Owned agents seen in this thread: pubkey -> { key: order, name }. Newest wins "last agent".
-function useThreadAgents(React, { relay, agents, log }, { scope, channelId, threadRootId, audience }) {
+// `enabled` false (send-time tag turned off) skips the relay read entirely.
+function useThreadAgents(React, { relay, agents, log }, { scope, channelId, threadRootId, audience }, enabled) {
   const thread = React.useRef(new Map());
   React.useEffect(() => {
+    thread.current = new Map();
+    if (!enabled) return undefined;
     // Thread composers only; Solo chats (audience) and channel top level keep Buzz's own rules.
     if (!threadRootId || audience || !HEX64.test(threadRootId)) return undefined;
     const snap = relay.snapshot();
@@ -206,7 +373,7 @@ function useThreadAgents(React, { relay, agents, log }, { scope, channelId, thre
       controller.abort();
       stopLive();
     };
-  }, [scope, channelId, threadRootId, audience]);
+  }, [scope, channelId, threadRootId, audience, enabled]);
   return thread;
 }
 
@@ -231,19 +398,24 @@ function useBeforeSend(React, anchor, beforeSend) {
 
 // Rendered by the host in every composer; it shows nothing and only acts at send.
 function createSendTag(deps) {
-  const { react: React, log } = deps;
+  const { react: React, log, settings } = deps;
+  const sendTagOn = () => settings.get().sendTag;
   return function SendTag(props) {
     // Latest props for DOM listeners, which must not act on a stale draft.
     const latest = React.useRef(props);
     latest.current = props;
     const anchor = React.useRef(null);
-    const thread = useThreadAgents(React, deps, props);
+    const enabled = React.useSyncExternalStore(settings.subscribe, sendTagOn);
+    const thread = useThreadAgents(React, deps, props, enabled);
     useBeforeSend(React, anchor, (form) => {
       const p = latest.current;
+      // Settings are read at send, so a change in the card applies to the next message.
+      const { sendTag, targetRule } = settings.get();
+      if (!sendTag) return;
       if (!p.threadRootId || p.audience || p.disabled || p.recipients.length) return;
       if (form.hasAttribute("data-editing")) return;
       const agentsHere = [...thread.current.entries()].map(([pubkey, a]) => ({ pubkey, ...a }));
-      const target = pickComposerTarget(agentsHere, replyingToName(form));
+      const target = pickComposerTarget(agentsHere, replyingToName(form), targetRule);
       if (!target) return;
       if (p.replaceRecipients([{ pubkey: target.pubkey, name: target.name }]))
         log.record({ layer: LAYER.TAG, agent: target.name, message: p.threadRootId, status: `tagged (${target.rule})` });
@@ -293,7 +465,16 @@ function wakeSkipReason(snap, thread, channel) {
   return SKIPPED_CHANNEL_TYPES.has(channelInfo?.channelType) ? "solo chat" : undefined;
 }
 
-function createWakeHandler({ agents, log }) {
+// The target under the user's rule: a Reply names its parent's author, a plain
+// thread message the last agent; "last-only" and "reply-only" narrow that.
+async function findWakeTarget(input, targetRule) {
+  const isReply = input.thread.parent !== input.thread.root;
+  if (isReply && targetRule !== TARGET_RULE.LAST_ONLY) return parentTarget(input);
+  if (targetRule === TARGET_RULE.REPLY_ONLY) return { reason: "not a Reply to a message, and the target rule is reply-only" };
+  return lastAgentTarget(input);
+}
+
+function createWakeHandler({ agents, log, settings }) {
   const firstTime = createSeenOnce(MAX_SEEN);
   return async function handle(snap, message, signal) {
     if (message.kind !== CHAT_KIND) return;
@@ -307,9 +488,12 @@ function createWakeHandler({ agents, log }) {
     const channel = channelOf(message);
     const reason = wakeSkipReason(snap, thread, channel);
     if (reason) return skip(reason);
+    // Read per message, so a change in the settings card applies to the next one.
+    const { wakeFallback, targetRule } = settings.get();
+    if (!wakeFallback) return skip("wake fallback is off in settings");
 
     const input = { agents, snap, message, thread, channel, signal };
-    const found = thread.parent !== thread.root ? await parentTarget(input) : await lastAgentTarget(input);
+    const found = await findWakeTarget(input, targetRule);
     if (!found.agent) return skip(found.reason);
 
     try {
@@ -387,11 +571,106 @@ function createActivityPage({ react: React, log }) {
   };
 }
 
+// ---- Settings card -----------------------------------------------------------------
+
+// One labelled row in the host's settings layout (design-system class names).
+function settingRow(h, { id, title, description, control }) {
+  return h(
+    "div",
+    { "data-buzz-ui": "", className: "buzz-preference-row", "data-variant": "default" },
+    h(
+      "div",
+      { className: "buzz-preference-row-content" },
+      h("label", { htmlFor: id, className: "buzz-preference-row-label" }, title),
+      h("span", { className: "buzz-preference-row-description" }, description),
+    ),
+    h("div", { className: "buzz-preference-row-trailing" }, control),
+  );
+}
+
+// Each change saves at once after validation; nothing waits for a Save button
+// that a user could forget, and a refused change shows its reason.
+function createSettingsCard({ react: React, settings }) {
+  const h = React.createElement;
+  return function SettingsCard({ active }) {
+    const state = React.useSyncExternalStore(settings.subscribe, settings.snapshot);
+    const [error, setError] = React.useState("");
+    const run = (action) => {
+      // The host revokes a removed card's callbacks through active().
+      if (!active()) return;
+      try {
+        action();
+        setError("");
+      } catch (cause) {
+        console.warn(`${LOG_PREFIX} settings change refused`, { key: SETTINGS_STORAGE_KEY, error: cause });
+        setError(errorText(cause));
+      }
+    };
+    const { sendTag, wakeFallback, targetRule } = state.settings;
+    const rule = TARGET_RULE_OPTIONS.find((option) => option.value === targetRule);
+    const checkbox = (name, checked) =>
+      h("input", {
+        type: "checkbox",
+        id: `reply-wake-${name}`,
+        name,
+        checked,
+        onChange: (event) => run(() => settings.update({ [name]: event.target.checked })),
+      });
+    return h(
+      "section",
+      { "aria-label": `${SETTINGS_CARD.title} settings` },
+      h("p", { className: "text-body-sm text-subtle" }, "Saved on this device. Changes apply to the next message."),
+      h(
+        "div",
+        { "data-buzz-ui": "", className: "buzz-settings-group", "data-layout": "rows" },
+        settingRow(h, {
+          id: "reply-wake-sendTag",
+          title: "Add the tag at send",
+          description: "Desktop composer: an untagged thread message gets a mention of the target agent, with the full Buzz agent UI.",
+          control: checkbox("sendTag", sendTag),
+        }),
+        settingRow(h, {
+          id: "reply-wake-wakeFallback",
+          title: "Wake fallback",
+          description: "A thread message that still went out untagged (for example from mobile) wakes the target agent, without UI feedback.",
+          control: checkbox("wakeFallback", wakeFallback),
+        }),
+        settingRow(h, {
+          id: "reply-wake-targetRule",
+          title: "Target agent",
+          description: rule?.description ?? "",
+          control: h(
+            "select",
+            {
+              id: "reply-wake-targetRule",
+              name: "targetRule",
+              className: "buzz-input",
+              value: targetRule,
+              onChange: (event) => run(() => settings.update({ targetRule: event.target.value })),
+            },
+            TARGET_RULE_OPTIONS.map((option) => h("option", { key: option.value, value: option.value }, option.label)),
+          ),
+        }),
+      ),
+      state.problems.map((problem) => h("p", { key: problem, role: "status", className: "text-body-sm text-subtle" }, problem)),
+      error ? h("p", { role: "alert", className: "text-body-sm" }, error) : null,
+      h(
+        "button",
+        { type: "button", name: "reset", className: "buzz-button", "data-buzz-ui": "", onClick: () => run(() => settings.reset()) },
+        "Restore defaults",
+      ),
+    );
+  };
+}
+
 export function apply(ctx) {
-  const deps = { react: ctx.react, relay: ctx.relay, agents: ctx.agents, log: createActivityLog() };
+  const settings = createSettingsStore(deviceStorage());
+  const deps = { react: ctx.react, relay: ctx.relay, agents: ctx.agents, log: createActivityLog(), settings };
   ctx.conversation.registerTool({ ...TOOL, component: createSendTag(deps) });
   const handle = createWakeHandler(deps);
   ctx.effect(() => followRelay({ ...deps, handle }));
+  ctx.effect(() => followStorage(settings));
   // Debug log only, so it stays out of the sidebar; a plugin link still opens it when needed.
   ctx.pages.register({ ...PAGE, primary: false, component: createActivityPage(deps) });
+  ctx.settingsCards.register({ ...SETTINGS_CARD, component: createSettingsCard(deps) });
 }
