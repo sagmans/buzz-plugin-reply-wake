@@ -123,7 +123,9 @@ check_js_syntax() {
 	local path seen=0
 	for path in "${files[@]}"; do
 		case "$path" in *.js | *.mjs | *.cjs) ;; *) continue ;; esac
-		[ "$seen" -eq 1 ] || require_tool "$CHECK" node "$NODE_MIN_VERSION" 'install Node.js (https://nodejs.org)' node --version
+		# The watchdog uses a conditional call, so prerequisites must fail explicitly.
+		[ "$seen" -eq 1 ] || require_tool "$CHECK" node "$NODE_MIN_VERSION" 'install Node.js (https://nodejs.org)' node --version ||
+			fail "node prerequisite failed"
 		seen=1
 		node --check "$path" || fail "node --check failed: $path"
 	done
@@ -159,8 +161,10 @@ check_shell() {
 		case "$path:$first" in *.sh:* | *':#!'*sh) shells+=("$path") ;; esac
 	done
 	[ "${#shells[@]}" -gt 0 ] || return 0
-	require_tool "$CHECK" shellcheck "$SHELLCHECK_MIN_VERSION" 'install shellcheck (https://www.shellcheck.net)' shellcheck --version
-	require_tool "$CHECK" shfmt "$SHFMT_MIN_VERSION" 'install shfmt (https://github.com/mvdan/sh)' shfmt --version
+	require_tool "$CHECK" shellcheck "$SHELLCHECK_MIN_VERSION" 'install shellcheck (https://www.shellcheck.net)' shellcheck --version ||
+		fail "shellcheck prerequisite failed"
+	require_tool "$CHECK" shfmt "$SHFMT_MIN_VERSION" 'install shfmt (https://github.com/mvdan/sh)' shfmt --version ||
+		fail "shfmt prerequisite failed"
 	shellcheck --external-sources --severity=style "${shells[@]}" || fail "shellcheck found problems"
 	shfmt --diff "${shells[@]}" || fail "shfmt would reformat these files; run: shfmt --write <file>"
 }
@@ -195,7 +199,8 @@ check_markdown() {
 		case "$path" in *.md | *.MD | *.markdown) docs+=("$path") ;; esac
 	done
 	[ "${#docs[@]}" -gt 0 ] || return 0
-	require_tool "$CHECK" markdownlint-cli2 "$MARKDOWNLINT_MIN_VERSION" 'install markdownlint-cli2' markdownlint-cli2 --help
+	require_tool "$CHECK" markdownlint-cli2 "$MARKDOWNLINT_MIN_VERSION" 'install markdownlint-cli2' markdownlint-cli2 --help ||
+		fail "markdownlint prerequisite failed"
 	markdownlint-cli2 --config "$HOOK_LIB/markdownlint.jsonc" -- "${docs[@]}" || fail "markdownlint found problems"
 }
 
@@ -205,7 +210,8 @@ check_complexity() {
 		case "$path" in *.js | *.mjs | *.cjs) sources+=("$path") ;; esac
 	done
 	[ "${#sources[@]}" -gt 0 ] || return 0
-	require_tool "$CHECK" lizard "$LIZARD_MIN_VERSION" 'install lizard (pipx install lizard)' lizard --version
+	require_tool "$CHECK" lizard "$LIZARD_MIN_VERSION" 'install lizard (pipx install lizard)' lizard --version ||
+		fail "lizard prerequisite failed"
 	lizard --CCN "$LIZARD_MAX_CCN" --length "$LIZARD_MAX_LENGTH" --warnings_only "${sources[@]}" ||
 		fail "lizard: a function is above CCN $LIZARD_MAX_CCN or $LIZARD_MAX_LENGTH lines"
 }
