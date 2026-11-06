@@ -26,6 +26,9 @@ REPO_TOP="$(cd "$SELF_DIR/.." && pwd -P)"
 HOOK_LIB="$REPO_TOP/.githooks/lib"
 # shellcheck source-path=SCRIPTDIR source=../.githooks/lib/tools.sh
 . "$HOOK_LIB/tools.sh"
+# The shared watchdog bounds local tools and network scanners on macOS too.
+# shellcheck source-path=SCRIPTDIR source=../.githooks/lib/helpers.sh
+. "$HOOK_LIB/helpers.sh"
 
 CHECK=repo-check
 PLUGIN_DIR=plugin
@@ -41,6 +44,9 @@ MANIFEST_API_VERSION=1
 # to every function so old code cannot drift past them unnoticed.
 LIZARD_MAX_CCN=15
 LIZARD_MAX_LENGTH=100
+# Local tools and smoke workers can stall without a network request.
+LOCAL_TIMEOUT_SECONDS=300
+SMOKE_TIMEOUT_SECONDS=180
 # Network scanners must not freeze a push on a dead connection.
 SEMGREP_TIMEOUT_SECONDS=300
 TRIVY_TIMEOUT_SECONDS=300
@@ -212,8 +218,9 @@ check_semgrep() {
 		case "$path" in *.js | *.mjs | *.cjs) sources+=("$path") ;; esac
 	done
 	[ "${#sources[@]}" -gt 0 ] || return 0
-	require_tool "$CHECK" semgrep "$SEMGREP_MIN_VERSION" 'install semgrep (https://semgrep.dev)' semgrep --version
-	run_with_timeout "$SEMGREP_TIMEOUT_SECONDS" semgrep scan --config "$SEMGREP_REGISTRY_CONFIG" \
+	run_step 'semgrep version' "$LOCAL_TIMEOUT_SECONDS" \
+		require_tool "$CHECK" semgrep "$SEMGREP_MIN_VERSION" 'install semgrep (https://semgrep.dev)' semgrep --version
+	run_step 'semgrep registry scan' "$SEMGREP_TIMEOUT_SECONDS" semgrep scan --config "$SEMGREP_REGISTRY_CONFIG" \
 		--metrics=off --disable-version-check --error --quiet -- "${sources[@]}" ||
 		fail "semgrep $SEMGREP_REGISTRY_CONFIG failed (finding, network error or timeout)"
 }
@@ -221,22 +228,23 @@ check_semgrep() {
 # Second, independent secret engine next to gitleaks, plus misconfiguration
 # rules for any workflow or container file a later change adds.
 check_trivy() {
-	require_tool "$CHECK" trivy "$TRIVY_MIN_VERSION" 'install trivy (https://trivy.dev)' trivy --version
-	run_with_timeout "$TRIVY_TIMEOUT_SECONDS" trivy fs --quiet --scanners secret,misconfig \
+	run_step 'trivy version' "$LOCAL_TIMEOUT_SECONDS" \
+		require_tool "$CHECK" trivy "$TRIVY_MIN_VERSION" 'install trivy (https://trivy.dev)' trivy --version
+	run_step 'trivy scan' "$TRIVY_TIMEOUT_SECONDS" trivy fs --quiet --scanners secret,misconfig \
 		--skip-dirs .git --exit-code 1 --timeout "${TRIVY_TIMEOUT_SECONDS}s" . ||
 		fail "trivy found secrets or misconfigurations (or failed to run)"
 }
 
-check_js_syntax
-check_manifest
-check_shell
-check_private_data
+run_step 'JavaScript syntax' "$LOCAL_TIMEOUT_SECONDS" check_js_syntax
+run_step 'plugin manifest' "$LOCAL_TIMEOUT_SECONDS" check_manifest
+run_step 'shell checks' "$LOCAL_TIMEOUT_SECONDS" check_shell
+run_step 'private data scan' "$LOCAL_TIMEOUT_SECONDS" check_private_data
 if [ "$quick" -eq 1 ]; then
 	exit 0
 fi
-check_smoke
-check_markdown
-check_complexity
+run_step 'plugin smoke scenarios' "$SMOKE_TIMEOUT_SECONDS" check_smoke
+run_step 'Markdown lint' "$LOCAL_TIMEOUT_SECONDS" check_markdown
+run_step 'complexity scan' "$LOCAL_TIMEOUT_SECONDS" check_complexity
 check_semgrep
 check_trivy
 echo "✅ $CHECK: all checks passed for $target"
