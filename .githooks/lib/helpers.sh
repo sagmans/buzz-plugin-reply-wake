@@ -215,8 +215,14 @@ push_default_base() {
 	answer=$(run_step "read the default branch of the remote" "$PUSH_BASE_READ_TIMEOUT_SECONDS" \
 		ls_remote_quiet --symref "$remote" HEAD) || rc=$?
 	[ "$rc" -ne "$TIMEOUT_EXIT_STATUS" ] || return "$rc"
-	branch=$(printf '%s\n' "$answer" |
-		sed -n 's#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#\1#p' | head -n 1)
+	# A here-document, not a pipe into `head -n 1`: head exits early, the
+	# writer takes SIGPIPE, and pipefail would abort the hook on an answer with
+	# many symref lines. So sed takes the first match itself: the address
+	# selects a symref line, `s##` reuses that regex for its \1, and `q` stops.
+	branch=$(sed -n '\#^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$#{s##\1#p;q;}' <<EOF
+$answer
+EOF
+	)
 	if [ -n "$branch" ]; then
 		rc=0
 		answer=$(run_step "read the tip of the default branch on the remote" "$PUSH_BASE_READ_TIMEOUT_SECONDS" \
