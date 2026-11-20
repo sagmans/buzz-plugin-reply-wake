@@ -15,13 +15,15 @@ the README true when you change behavior.
 | `plugin/plugin.js` | The plugin: one self-contained ES module, no build step. |
 | `scripts/smoke.mjs` | Smoke scenarios: runs `plugin.js` with a fake Buzz context. |
 | `scripts/check` | All repository checks. The Git hooks call it. |
+| `biome.json` | Biome lint and format rules for JavaScript and JSON. |
+| `mise.toml` | Pinned tool releases for the repository checks. |
 | `scripts/setup-hooks` | Turns on the Git hooks for a clone. Copied from a template. |
 | `.githooks/` | Generic hooks and helpers, copied from a template. |
 | `.githooks/<hook>.d/` | This repository's own hook checks. |
 
 ## Setup and checks
 
-1. Run `scripts/setup-hooks` once after you clone.
+1. Run `mise install` and `scripts/setup-hooks` once after you clone.
 2. Run `scripts/check --quick` while you work, and `scripts/check` before
    you push.
 3. Run one file of scenarios with `node scripts/smoke.mjs [path/to/plugin.js]`.

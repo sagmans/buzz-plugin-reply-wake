@@ -62,12 +62,22 @@ function createReact() {
     return current.hooks[index];
   };
   const React = {
-    createElement: (type, props, ...children) => ({ type, props: props ?? {}, children: children.flat() }),
+    createElement: (type, props, ...children) => ({
+      type,
+      props: props ?? {},
+      children: children.flat(),
+    }),
     useRef: (initial) => slot(() => ({ current: initial })),
     useState(initial) {
       const instance = current;
       const state = slot(() => ({ value: typeof initial === "function" ? initial() : initial }));
-      return [state.value, (next) => ((state.value = typeof next === "function" ? next(state.value) : next), instance.render())];
+      return [
+        state.value,
+        (next) => {
+          state.value = typeof next === "function" ? next(state.value) : next;
+          instance.render();
+        },
+      ];
     },
     useMemo: (factory) => factory(),
     useCallback: (fn) => fn,
@@ -84,7 +94,11 @@ function createReact() {
       instance.pending.push(() => {
         state.cleanup?.();
         const cleanup = effect();
-        Object.assign(state, { deps, ran: true, cleanup: typeof cleanup === "function" ? cleanup : undefined });
+        Object.assign(state, {
+          deps,
+          ran: true,
+          cleanup: typeof cleanup === "function" ? cleanup : undefined,
+        });
       });
     },
   };
@@ -99,13 +113,20 @@ function createReact() {
       } finally {
         current = null;
       }
-      walk(instance.tree, (node) => node.props.ref && (node.props.ref.current = attach(node)));
+      walk(instance.tree, (node) => {
+        if (node.props.ref) node.props.ref.current = attach(node);
+      });
       const pending = instance.pending.splice(0);
-      pending.forEach((run) => run());
+      for (const run of pending) run();
       return instance.tree;
     };
-    instance.update = (next) => ((instance.props = next), instance.render());
-    instance.unmount = () => instance.hooks.forEach((hook) => hook?.cleanup?.());
+    instance.update = (next) => {
+      instance.props = next;
+      return instance.render();
+    };
+    instance.unmount = () => {
+      for (const hook of instance.hooks) hook?.cleanup?.();
+    };
     instance.render();
     return instance;
   };
@@ -114,9 +135,12 @@ function createReact() {
 
 function walk(node, visit) {
   if (!node || typeof node !== "object") return;
-  if (Array.isArray(node)) return node.forEach((child) => walk(child, visit));
+  if (Array.isArray(node)) {
+    for (const child of node) walk(child, visit);
+    return;
+  }
   if (node.props) visit(node);
-  (node.children ?? []).forEach((child) => walk(child, visit));
+  for (const child of node.children ?? []) walk(child, visit);
 }
 
 function findByName(tree, name) {
@@ -151,8 +175,12 @@ function createForm({ replyingTo, editing = false } = {}) {
     addEventListener: (type, listener) => listeners[type].add(listener),
     removeEventListener: (type, listener) => listeners[type].delete(listener),
     listenerCount: () => listeners.keydown.size + listeners.submit.size,
-    pressEnter: (keys = {}) => listeners.keydown.forEach((l) => l({ key: "Enter", target: editor, keyCode: 13, ...keys })),
-    submit: () => listeners.submit.forEach((l) => l({})),
+    pressEnter(keys = {}) {
+      for (const l of listeners.keydown) l({ key: "Enter", target: editor, keyCode: 13, ...keys });
+    },
+    submit() {
+      for (const l of listeners.submit) l({});
+    },
   };
   return form;
 }
@@ -162,7 +190,7 @@ function createForm({ replyingTo, editing = false } = {}) {
 function event({ id, pubkey, at, content = "", channel = CHANNEL, root, parent, mentions = [] }) {
   const tags = [["h", channel]];
   if (root) tags.push(["e", root, "", "root"], ["e", parent ?? root, "", "reply"]);
-  mentions.forEach((p) => tags.push(["p", p]));
+  for (const p of mentions) tags.push(["p", p]);
   return { id: hex(id), kind: CHAT_KIND, pubkey, created_at: at, content, tags };
 }
 
@@ -205,8 +233,10 @@ function createHost(fixture, { wakeThrows = false, storage } = {}) {
       if (signal?.aborted) throw signal.reason;
       const found = new Map();
       for (const filter of filters) {
-        const hits = fixture.events.filter((e) => matches(filter, e)).sort((a, b) => b.created_at - a.created_at);
-        hits.slice(0, filter.limit ?? hits.length).forEach((e) => found.set(e.id, e));
+        const hits = fixture.events
+          .filter((e) => matches(filter, e))
+          .sort((a, b) => b.created_at - a.created_at);
+        for (const e of hits.slice(0, filter.limit ?? hits.length)) found.set(e.id, e);
       }
       return [...found.values()];
     },
@@ -219,7 +249,13 @@ function createHost(fixture, { wakeThrows = false, storage } = {}) {
   const wakes = [];
   const registered = { tools: [], pages: [], cards: [], effects: [] };
   const ctx = {
-    relay: { snapshot: () => snap, subscribe: (l) => (relayListeners.add(l), () => relayListeners.delete(l)) },
+    relay: {
+      snapshot: () => snap,
+      subscribe(l) {
+        relayListeners.add(l);
+        return () => relayListeners.delete(l);
+      },
+    },
     agents: {
       find: (pubkey) => Object.values(AGENTS).find((a) => a.pubkey === pubkey),
       wake(key, wake) {
@@ -232,7 +268,9 @@ function createHost(fixture, { wakeThrows = false, storage } = {}) {
     settingsCards: { register: (card) => registered.cards.push(card) },
     effect: (fn) => registered.effects.push(fn()),
   };
-  const live = (events, replay = false) => liveListeners.forEach((l) => l({ events, replay }));
+  const live = (events, replay = false) => {
+    for (const l of liveListeners) l({ events, replay });
+  };
   return { ctx, wakes, registered, live, storage };
 }
 
@@ -264,7 +302,10 @@ async function startPlugin(plugin, { stored, wakeThrows } = {}) {
 }
 
 // Mount the send-time tool in a thread composer and return what it did at send.
-async function composer(run, { replyingTo, recipients = [], threadRootId = run.fixture.root, ...props } = {}) {
+async function composer(
+  run,
+  { replyingTo, recipients = [], threadRootId = run.fixture.root, ...props } = {},
+) {
   const form = createForm({ replyingTo, editing: props.editing });
   const replaced = [];
   const tool = run.registered.tools[0];
@@ -274,10 +315,15 @@ async function composer(run, { replyingTo, recipients = [], threadRootId = run.f
     threadRootId,
     disabled: false,
     recipients,
-    replaceRecipients: (list) => (replaced.push(list), true),
+    replaceRecipients(list) {
+      replaced.push(list);
+      return true;
+    },
     ...props,
   };
-  const view = run.React.mount(tool.component, toolProps, () => ({ closest: (s) => (s === "form" ? form : null) }));
+  const view = run.React.mount(tool.component, toolProps, () => ({
+    closest: (s) => (s === "form" ? form : null),
+  }));
   await settle();
   return { form, replaced, view };
 }
@@ -298,14 +344,29 @@ function expect(name, condition, message, details) {
 
 function expectTag(name, replaced, agent) {
   expect(name, replaced.length === 1, "expected exactly one tag at send", replaced);
-  expect(name, replaced[0][0]?.pubkey === agent.pubkey && replaced[0][0]?.name === agent.name, `expected ${agent.name}`, replaced);
+  expect(
+    name,
+    replaced[0][0]?.pubkey === agent.pubkey && replaced[0][0]?.name === agent.name,
+    `expected ${agent.name}`,
+    replaced,
+  );
 }
 
 function expectWake(name, wakes, agent, rule, root) {
   expect(name, wakes.length === 1, "expected exactly one wake", wakes);
   const [wake] = wakes;
-  expect(name, wake.key === agent.key && wake.channel === CHANNEL && wake.root === root, `expected a wake of ${agent.name}`, wake);
-  expect(name, wake.text.startsWith(`${WAKE_PREFIX}:`) && wake.text.includes(`"${rule}" rule`), "unexpected wake text", wake.text);
+  expect(
+    name,
+    wake.key === agent.key && wake.channel === CHANNEL && wake.root === root,
+    `expected a wake of ${agent.name}`,
+    wake,
+  );
+  expect(
+    name,
+    wake.text.startsWith(`${WAKE_PREFIX}:`) && wake.text.includes(`"${rule}" rule`),
+    "unexpected wake text",
+    wake.text,
+  );
 }
 
 // ---- Scenarios: send-time tag (layer 1) ----------------------------------------------------
@@ -331,7 +392,9 @@ async function sendTagScenarios(plugin) {
   });
   await scenario("tag: already-tagged message is left unchanged", async () => {
     const run = await startPlugin(plugin);
-    const { form, replaced } = await composer(run, { recipients: [{ pubkey: AGENTS.alpha.pubkey, name: AGENTS.alpha.name }] });
+    const { form, replaced } = await composer(run, {
+      recipients: [{ pubkey: AGENTS.alpha.pubkey, name: AGENTS.alpha.name }],
+    });
     form.pressEnter();
     form.submit();
     expect("tagged", replaced.length === 0, "a tagged draft must not change", replaced);
@@ -342,23 +405,28 @@ async function sendTagScenarios(plugin) {
     form.submit();
     expectTag("submit", replaced, AGENTS.beta);
   });
-  await scenario("tag: Shift+Enter, IME Enter, edit mode and disabled composer add no tag", async () => {
-    const run = await startPlugin(plugin);
-    const plain = await composer(run);
-    plain.form.pressEnter({ shiftKey: true });
-    plain.form.pressEnter({ isComposing: true });
-    plain.form.pressEnter({ keyCode: 229 });
-    const editing = await composer(run, { editing: true });
-    editing.form.pressEnter();
-    const disabled = await composer(run, { disabled: true });
-    disabled.form.pressEnter();
-    const all = [...plain.replaced, ...editing.replaced, ...disabled.replaced];
-    expect("keys", all.length === 0, "no tag expected", all);
-  });
+  await scenario(
+    "tag: Shift+Enter, IME Enter, edit mode and disabled composer add no tag",
+    async () => {
+      const run = await startPlugin(plugin);
+      const plain = await composer(run);
+      plain.form.pressEnter({ shiftKey: true });
+      plain.form.pressEnter({ isComposing: true });
+      plain.form.pressEnter({ keyCode: 229 });
+      const editing = await composer(run, { editing: true });
+      editing.form.pressEnter();
+      const disabled = await composer(run, { disabled: true });
+      disabled.form.pressEnter();
+      const all = [...plain.replaced, ...editing.replaced, ...disabled.replaced];
+      expect("keys", all.length === 0, "no tag expected", all);
+    },
+  );
   await scenario("tag: a live agent message becomes the new last agent", async () => {
     const run = await startPlugin(plugin);
     const { form, replaced } = await composer(run);
-    run.live([event({ id: "alpha-2", pubkey: AGENTS.alpha.pubkey, at: 140, root: run.fixture.root })]);
+    run.live([
+      event({ id: "alpha-2", pubkey: AGENTS.alpha.pubkey, at: 140, root: run.fixture.root }),
+    ]);
     form.pressEnter();
     expectTag("live", replaced, AGENTS.alpha);
   });
@@ -376,7 +444,10 @@ async function sendTagScenarios(plugin) {
 // ---- Scenarios: wake fallback (layer 2) ---------------------------------------------------------
 
 // An untagged message of the user as another client (for example mobile) sends it.
-function userMessage(run, { id, at = 150, parent, channel = CHANNEL, mentions, root = run.fixture.root, pubkey = USER }) {
+function userMessage(
+  run,
+  { id, at = 150, parent, channel = CHANNEL, mentions, root = run.fixture.root, pubkey = USER },
+) {
   return event({ id, pubkey, at, channel, root, parent, mentions, content: "please continue" });
 }
 
@@ -393,24 +464,30 @@ async function wakeScenarios(plugin) {
     await settle();
     expectWake("wake-reply", run.wakes, AGENTS.alpha, "reply", run.fixture.root);
   });
-  await scenario("wake: Reply to a person's or another owner's agent message wakes nobody", async () => {
-    const run = await startPlugin(plugin);
-    run.live([userMessage(run, { id: "u-person", parent: run.fixture.byId("person-1") })]);
-    run.live([userMessage(run, { id: "u-xeno", parent: run.fixture.byId("xeno-1") })]);
-    await settle();
-    expect("wake-person", run.wakes.length === 0, "no wake expected", run.wakes);
-  });
-  await scenario("wake: tagged message, replay, duplicate and agent-authored message wake nobody extra", async () => {
-    const run = await startPlugin(plugin);
-    run.live([userMessage(run, { id: "u-tagged", mentions: [AGENTS.alpha.pubkey] })]);
-    run.live([userMessage(run, { id: "u-replay" })], true);
-    run.live([userMessage(run, { id: "u-agent", pubkey: AGENTS.alpha.pubkey })]);
-    const once = userMessage(run, { id: "u-once" });
-    run.live([once]);
-    run.live([once]);
-    await settle();
-    expectWake("wake-filters", run.wakes, AGENTS.beta, "last agent", run.fixture.root);
-  });
+  await scenario(
+    "wake: Reply to a person's or another owner's agent message wakes nobody",
+    async () => {
+      const run = await startPlugin(plugin);
+      run.live([userMessage(run, { id: "u-person", parent: run.fixture.byId("person-1") })]);
+      run.live([userMessage(run, { id: "u-xeno", parent: run.fixture.byId("xeno-1") })]);
+      await settle();
+      expect("wake-person", run.wakes.length === 0, "no wake expected", run.wakes);
+    },
+  );
+  await scenario(
+    "wake: tagged message, replay, duplicate and agent-authored message wake nobody extra",
+    async () => {
+      const run = await startPlugin(plugin);
+      run.live([userMessage(run, { id: "u-tagged", mentions: [AGENTS.alpha.pubkey] })]);
+      run.live([userMessage(run, { id: "u-replay" })], true);
+      run.live([userMessage(run, { id: "u-agent", pubkey: AGENTS.alpha.pubkey })]);
+      const once = userMessage(run, { id: "u-once" });
+      run.live([once]);
+      run.live([once]);
+      await settle();
+      expectWake("wake-filters", run.wakes, AGENTS.beta, "last agent", run.fixture.root);
+    },
+  );
   await scenario("wake: Solo chat and channel top level are skipped", async () => {
     const run = await startPlugin(plugin);
     run.live([userMessage(run, { id: "u-solo", channel: SOLO_CHANNEL })]);
@@ -423,20 +500,43 @@ async function wakeScenarios(plugin) {
     run.live([userMessage(run, { id: "u-fail" })]);
     await settle();
     const page = run.React.mount(run.registered.pages[0].component, {});
-    expect("wake-fail", textOf(page.tree).includes("not woken: agent queue is full"), "activity page must show the failure", textOf(page.tree));
+    expect(
+      "wake-fail",
+      textOf(page.tree).includes("not woken: agent queue is full"),
+      "activity page must show the failure",
+      textOf(page.tree),
+    );
   });
 }
 
 // ---- Scenarios: settings ---------------------------------------------------------------------------
 
-async function settingsScenarios(plugin) {
+// Rule evaluation is exercised apart from persistence so failures pinpoint the broken contract.
+async function settingsRuleScenarios(plugin) {
   await scenario("settings: the card shows today's behavior as the default", async () => {
     const run = await startPlugin(plugin);
-    expect("defaults", run.registered.cards.length === 1, "one settings card expected", run.registered.cards);
+    expect(
+      "defaults",
+      run.registered.cards.length === 1,
+      "one settings card expected",
+      run.registered.cards,
+    );
     const card = run.React.mount(run.registered.cards[0].component, { active: () => true });
-    expect("defaults", findByName(card.tree, "sendTag")?.props.checked === true, "send-time tag must default on");
-    expect("defaults", findByName(card.tree, "wakeFallback")?.props.checked === true, "wake fallback must default on");
-    expect("defaults", findByName(card.tree, "targetRule")?.props.value === "reply-then-last", "rule must default to reply-then-last");
+    expect(
+      "defaults",
+      findByName(card.tree, "sendTag")?.props.checked === true,
+      "send-time tag must default on",
+    );
+    expect(
+      "defaults",
+      findByName(card.tree, "wakeFallback")?.props.checked === true,
+      "wake fallback must default on",
+    );
+    expect(
+      "defaults",
+      findByName(card.tree, "targetRule")?.props.value === "reply-then-last",
+      "rule must default to reply-then-last",
+    );
   });
   await scenario("settings: reply-only ignores plain thread messages", async () => {
     const run = await startPlugin(plugin, { stored: JSON.stringify({ targetRule: "reply-only" }) });
@@ -444,7 +544,12 @@ async function settingsScenarios(plugin) {
     plain.form.pressEnter();
     const reply = await composer(run, { replyingTo: AGENTS.alpha.name });
     reply.form.pressEnter();
-    expect("reply-only", plain.replaced.length === 0, "plain message must not be tagged", plain.replaced);
+    expect(
+      "reply-only",
+      plain.replaced.length === 0,
+      "plain message must not be tagged",
+      plain.replaced,
+    );
     expectTag("reply-only", reply.replaced, AGENTS.alpha);
     run.live([userMessage(run, { id: "s-plain" })]);
     run.live([userMessage(run, { id: "s-reply", parent: run.fixture.byId("alpha-1") })]);
@@ -461,41 +566,84 @@ async function settingsScenarios(plugin) {
     expectWake("last-only", run.wakes, AGENTS.beta, "last agent", run.fixture.root);
   });
   await scenario("settings: each layer can be turned off", async () => {
-    const run = await startPlugin(plugin, { stored: JSON.stringify({ sendTag: false, wakeFallback: false }) });
+    const run = await startPlugin(plugin, {
+      stored: JSON.stringify({ sendTag: false, wakeFallback: false }),
+    });
     const plain = await composer(run);
     plain.form.pressEnter();
     run.live([userMessage(run, { id: "s-off" })]);
     await settle();
-    expect("off", plain.replaced.length === 0 && run.wakes.length === 0, "nothing expected", { tags: plain.replaced, wakes: run.wakes });
+    expect("off", plain.replaced.length === 0 && run.wakes.length === 0, "nothing expected", {
+      tags: plain.replaced,
+      wakes: run.wakes,
+    });
   });
-  await scenario("settings: invalid saved values fall back to defaults and are reported", async () => {
-    const broken = await startPlugin(plugin, { stored: "{not json" });
-    const plain = await composer(broken);
-    plain.form.pressEnter();
-    expectTag("invalid-json", plain.replaced, AGENTS.beta);
-    const card = broken.React.mount(broken.registered.cards[0].component, { active: () => true });
-    expect("invalid-json", /not JSON/.test(textOf(card.tree)), "card must report the broken value", textOf(card.tree));
-    const partly = await startPlugin(plugin, { stored: JSON.stringify({ targetRule: "bogus", wakeFallback: false }) });
-    const reply = await composer(partly, { replyingTo: AGENTS.alpha.name });
-    reply.form.pressEnter();
-    expectTag("invalid-field", reply.replaced, AGENTS.alpha);
-    partly.live([userMessage(partly, { id: "s-partly" })]);
-    await settle();
-    expect("invalid-field", partly.wakes.length === 0, "valid fields must still apply", partly.wakes);
-  });
+}
+
+// Corrupt storage and live card edits share validation, so both recovery paths live together.
+async function settingsPersistenceScenarios(plugin) {
+  await scenario(
+    "settings: invalid saved values fall back to defaults and are reported",
+    async () => {
+      const broken = await startPlugin(plugin, { stored: "{not json" });
+      const plain = await composer(broken);
+      plain.form.pressEnter();
+      expectTag("invalid-json", plain.replaced, AGENTS.beta);
+      const card = broken.React.mount(broken.registered.cards[0].component, { active: () => true });
+      expect(
+        "invalid-json",
+        /not JSON/.test(textOf(card.tree)),
+        "card must report the broken value",
+        textOf(card.tree),
+      );
+      const partly = await startPlugin(plugin, {
+        stored: JSON.stringify({ targetRule: "bogus", wakeFallback: false }),
+      });
+      const reply = await composer(partly, { replyingTo: AGENTS.alpha.name });
+      reply.form.pressEnter();
+      expectTag("invalid-field", reply.replaced, AGENTS.alpha);
+      partly.live([userMessage(partly, { id: "s-partly" })]);
+      await settle();
+      expect(
+        "invalid-field",
+        partly.wakes.length === 0,
+        "valid fields must still apply",
+        partly.wakes,
+      );
+    },
+  );
   await scenario("settings: changes in the card persist and apply at once", async () => {
     const run = await startPlugin(plugin);
     const card = run.React.mount(run.registered.cards[0].component, { active: () => true });
     findByName(card.tree, "targetRule").props.onChange({ target: { value: "reply-only" } });
     findByName(card.tree, "wakeFallback").props.onChange({ target: { checked: false } });
     const saved = JSON.parse(run.storage.raw());
-    expect("card", saved.targetRule === "reply-only" && saved.wakeFallback === false, "settings must be saved", saved);
+    expect(
+      "card",
+      saved.targetRule === "reply-only" && saved.wakeFallback === false,
+      "settings must be saved",
+      saved,
+    );
     const plain = await composer(run);
     plain.form.pressEnter();
-    expect("card", plain.replaced.length === 0, "new rule must apply without restart", plain.replaced);
+    expect(
+      "card",
+      plain.replaced.length === 0,
+      "new rule must apply without restart",
+      plain.replaced,
+    );
     findByName(card.tree, "targetRule").props.onChange({ target: { value: "<script>" } });
-    expect("card", JSON.parse(run.storage.raw()).targetRule === "reply-only", "an invalid choice must not be saved");
-    expect("card", /not valid/.test(textOf(card.tree)), "card must show why it refused", textOf(card.tree));
+    expect(
+      "card",
+      JSON.parse(run.storage.raw()).targetRule === "reply-only",
+      "an invalid choice must not be saved",
+    );
+    expect(
+      "card",
+      /not valid/.test(textOf(card.tree)),
+      "card must show why it refused",
+      textOf(card.tree),
+    );
     findByName(card.tree, "reset").props.onClick();
     expect("card", run.storage.raw() === undefined, "restore defaults must clear the saved value");
     const inactive = run.React.mount(run.registered.cards[0].component, { active: () => false });
@@ -510,13 +658,18 @@ async function main() {
   const hasSettings = plugin.inject.includes("settingsCards");
   await sendTagScenarios(plugin);
   await wakeScenarios(plugin);
-  if (hasSettings) await settingsScenarios(plugin);
+  if (hasSettings) {
+    await settingsRuleScenarios(plugin);
+    await settingsPersistenceScenarios(plugin);
+  }
   for (const r of results) {
     console.log(`${r.ok ? "PASS" : "FAIL"}  ${r.name}`);
     if (!r.ok) console.log(`      ${r.error?.stack ?? r.error}`);
   }
   const failed = results.filter((r) => !r.ok).length;
-  console.log(`smoke: ${results.length - failed}/${results.length} passed (${path}${hasSettings ? "" : ", no settings card"})`);
+  console.log(
+    `smoke: ${results.length - failed}/${results.length} passed (${path}${hasSettings ? "" : ", no settings card"})`,
+  );
   process.exitCode = failed ? 1 : 0;
 }
 

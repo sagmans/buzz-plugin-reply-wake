@@ -35,6 +35,15 @@ PLUGIN_DIR=plugin
 MANIFEST="$PLUGIN_DIR/manifest.json"
 PLUGIN_JS="$PLUGIN_DIR/plugin.js"
 SMOKE=scripts/smoke.mjs
+BIOME_CONFIG=biome.json
+MISE_CONFIG=mise.toml
+# Shared hook template files (.githooks/<hook> and .githooks/lib/*) are owned
+# by the template repository; repo-owned .githooks/*.d/* still runs checks.
+TEMPLATE_HOOK_RE='^\.githooks/lib/|^\.githooks/[^/]+$'
+# Patterns for reading the pinned Biome version from mise.toml and CLI output.
+MISE_SECTION_RE='^[[:space:]]*\[([^]]+)\][[:space:]]*$'
+MISE_BIOME_PIN_RE='^[[:space:]]*biome[[:space:]]*=[[:space:]]*"([0-9]+\.[0-9]+\.[0-9]+)"[[:space:]]*$'
+BIOME_VERSION_RE='Version:[[:space:]]*([0-9]+\.[0-9]+\.[0-9]+)'
 # Buzz manifest limits (buzz-app crates/plugin-manager): id shape and length,
 # description size in bytes.
 MANIFEST_ID_RE='^[a-z][a-z0-9.-]{0,79}$'
@@ -51,8 +60,9 @@ SMOKE_TIMEOUT_SECONDS=180
 SEMGREP_TIMEOUT_SECONDS=300
 TRIVY_TIMEOUT_SECONDS=300
 SEMGREP_REGISTRY_CONFIG=p/javascript
+# Security floor: carries the November 2026 Node.js CVE fixes.
+NODE_MIN_VERSION=24.22.3
 # Minimum versions: the releases these flags and rule sets were verified with.
-NODE_MIN_VERSION=20.0.0
 SHELLCHECK_MIN_VERSION=0.10.0
 SHFMT_MIN_VERSION=3.8.0
 MARKDOWNLINT_MIN_VERSION=0.23.2
@@ -79,7 +89,7 @@ PRIVATE_PATTERNS=(
 PRIVATE_ALLOWED_RE='@example\.(com|org|net)'
 # Files copied from the hook template stay byte-identical to it, so their
 # style is the template's concern; repo-owned shell lives elsewhere.
-TEMPLATE_SHELL_RE='^(\.githooks/[^/]+|\.githooks/lib/.*|scripts/setup-hooks)$'
+TEMPLATE_SHELL_RE="($TEMPLATE_HOOK_RE|^scripts/setup-hooks$)"
 
 quick=0
 if [ "${1:-}" = --quick ]; then
@@ -89,6 +99,28 @@ fi
 default_target="$(git rev-parse --show-toplevel 2>/dev/null || printf '%s' "$REPO_TOP")"
 target="$(cd "${1:-$default_target}" && pwd -P)"
 cd "$target"
+
+# Resolve pinned CLI tools directly from this checkout's mise.toml before shims
+# or ambient PATH, and ignore any untrusted mise.toml inside a temporary staged
+# snapshot or commit worktree.
+use_mise_tools() {
+	local mise_dir="$1" checked_dir="$2" bins dir prefix=""
+	if [ "$checked_dir" != "$mise_dir" ]; then
+		MISE_IGNORED_CONFIG_PATHS="${MISE_IGNORED_CONFIG_PATHS:+$MISE_IGNORED_CONFIG_PATHS:}$checked_dir"
+		export MISE_IGNORED_CONFIG_PATHS
+	fi
+	command -v mise >/dev/null 2>&1 || return 0
+	[ ! -L "$mise_dir/$MISE_CONFIG" ] && [ -f "$mise_dir/$MISE_CONFIG" ] || return 0
+	bins="$(MISE_OFFLINE=1 mise -C "$mise_dir" bin-paths </dev/null 2>/dev/null || true)"
+	[ -n "$bins" ] || return 0
+	while IFS= read -r dir; do
+		[ -n "$dir" ] || continue
+		prefix="${prefix:+$prefix:}$dir"
+	done <<<"$bins"
+	[ -n "$prefix" ] && PATH="$prefix:$PATH"
+	export PATH
+}
+use_mise_tools "$REPO_TOP" "$target"
 
 fail() {
 	echo >&2 "❌ $CHECK: $*"
@@ -124,11 +156,69 @@ check_js_syntax() {
 	for path in "${files[@]}"; do
 		case "$path" in *.js | *.mjs | *.cjs) ;; *) continue ;; esac
 		# The watchdog uses a conditional call, so prerequisites must fail explicitly.
-		[ "$seen" -eq 1 ] || require_tool "$CHECK" node "$NODE_MIN_VERSION" 'install Node.js (https://nodejs.org)' node --version ||
+		[ "$seen" -eq 1 ] || require_tool "$CHECK" node "$NODE_MIN_VERSION" 'install Node.js (mise install, see mise.toml)' node --version ||
 			fail "node prerequisite failed"
 		seen=1
 		node --check "$path" || fail "node --check failed: $path"
 	done
+}
+
+# Exact Biome version pinned under [tools] in mise.toml, so an outdated
+# install or a weakened pin in a staged commit fails closed.
+biome_pinned_version() {
+	local file="$1" line in_tools=0
+	while IFS= read -r line || [ -n "$line" ]; do
+		line="${line%%#*}"
+		if [[ "$line" =~ $MISE_SECTION_RE ]]; then
+			if [ "${BASH_REMATCH[1]}" = tools ]; then
+				in_tools=1
+			else
+				in_tools=0
+			fi
+			continue
+		fi
+		if [ "$in_tools" -eq 1 ] && [[ "$line" =~ $MISE_BIOME_PIN_RE ]]; then
+			printf '%s\n' "${BASH_REMATCH[1]}"
+			return 0
+		fi
+	done <"$file"
+	return 1
+}
+
+# Keep JS and JSON formatting and lint aligned with biome.json, using only
+# the exact Biome version pinned in mise.toml so local hooks never drift.
+check_biome() {
+	local path sources=() config_root config_file pin_file pinned biome_bin out version
+	for path in "${files[@]}"; do
+		[[ "$path" =~ $TEMPLATE_HOOK_RE ]] && continue
+		case "$path" in *.js | *.mjs | *.cjs | *.json) sources+=("$path") ;; esac
+	done
+	[ "${#sources[@]}" -gt 0 ] || return 0
+	# Pre-commit validates the staged biome.json and mise.toml so a broken
+	# config or pin cannot be committed; pre-push judges every commit in the
+	# range against this checkout's active config and pin.
+	if [ "$quick" -eq 1 ]; then
+		config_root="$target"
+	else
+		config_root="$REPO_TOP"
+	fi
+	config_file="$config_root/$BIOME_CONFIG"
+	pin_file="$config_root/$MISE_CONFIG"
+	[ ! -L "$config_file" ] && [ -f "$config_file" ] || fail "$BIOME_CONFIG is missing or a symlink at $config_file"
+	[ ! -L "$pin_file" ] && [ -f "$pin_file" ] || fail "$MISE_CONFIG is missing or a symlink at $pin_file"
+	pinned="$(biome_pinned_version "$pin_file")" ||
+		fail "pin an exact biome = \"X.Y.Z\" version under [tools] in $MISE_CONFIG"
+	biome_bin="$(command -v biome 2>/dev/null || true)"
+	[ -n "$biome_bin" ] || fail "biome $pinned not found; run: mise install"
+	out="$("$biome_bin" --version 2>/dev/null || true)"
+	if ! [[ "$out" =~ $BIOME_VERSION_RE ]]; then
+		fail "cannot read the biome version from '$biome_bin --version'"
+	fi
+	version="${BASH_REMATCH[1]}"
+	[ "$version" = "$pinned" ] ||
+		fail "biome $version does not match $MISE_CONFIG pin $pinned; run: mise install"
+	"$biome_bin" check --config-path="$config_file" --error-on-warnings -- "${sources[@]}" ||
+		fail "biome found lint or format problems; run: mise exec -- biome check --write ."
 }
 
 # Buzz rejects the whole install for a bad manifest; catch it before it ships.
@@ -163,7 +253,7 @@ check_shell() {
 	[ "${#shells[@]}" -gt 0 ] || return 0
 	require_tool "$CHECK" shellcheck "$SHELLCHECK_MIN_VERSION" 'install shellcheck (https://www.shellcheck.net)' shellcheck --version ||
 		fail "shellcheck prerequisite failed"
-	require_tool "$CHECK" shfmt "$SHFMT_MIN_VERSION" 'install shfmt (https://github.com/mvdan/sh)' shfmt --version ||
+	require_tool "$CHECK" shfmt "$SHFMT_MIN_VERSION" 'install shfmt (mise install, see mise.toml)' shfmt --version ||
 		fail "shfmt prerequisite failed"
 	shellcheck --external-sources --severity=style "${shells[@]}" || fail "shellcheck found problems"
 	shfmt --diff "${shells[@]}" || fail "shfmt would reformat these files; run: shfmt --write <file>"
@@ -199,7 +289,7 @@ check_markdown() {
 		case "$path" in *.md | *.MD | *.markdown) docs+=("$path") ;; esac
 	done
 	[ "${#docs[@]}" -gt 0 ] || return 0
-	require_tool "$CHECK" markdownlint-cli2 "$MARKDOWNLINT_MIN_VERSION" 'install markdownlint-cli2' markdownlint-cli2 --help ||
+	require_tool "$CHECK" markdownlint-cli2 "$MARKDOWNLINT_MIN_VERSION" 'install markdownlint-cli2 (mise install, see mise.toml)' markdownlint-cli2 --help ||
 		fail "markdownlint prerequisite failed"
 	markdownlint-cli2 --config "$HOOK_LIB/markdownlint.jsonc" -- "${docs[@]}" || fail "markdownlint found problems"
 }
@@ -207,10 +297,11 @@ check_markdown() {
 check_complexity() {
 	local path sources=()
 	for path in "${files[@]}"; do
+		[[ "$path" =~ $TEMPLATE_HOOK_RE ]] && continue
 		case "$path" in *.js | *.mjs | *.cjs) sources+=("$path") ;; esac
 	done
 	[ "${#sources[@]}" -gt 0 ] || return 0
-	require_tool "$CHECK" lizard "$LIZARD_MIN_VERSION" 'install lizard (pipx install lizard)' lizard --version ||
+	require_tool "$CHECK" lizard "$LIZARD_MIN_VERSION" 'install lizard (mise install, see mise.toml)' lizard --version ||
 		fail "lizard prerequisite failed"
 	lizard --CCN "$LIZARD_MAX_CCN" --length "$LIZARD_MAX_LENGTH" --warnings_only "${sources[@]}" ||
 		fail "lizard: a function is above CCN $LIZARD_MAX_CCN or $LIZARD_MAX_LENGTH lines"
@@ -242,6 +333,7 @@ check_trivy() {
 }
 
 run_step 'JavaScript syntax' "$LOCAL_TIMEOUT_SECONDS" check_js_syntax
+run_step 'Biome lint and format' "$LOCAL_TIMEOUT_SECONDS" check_biome
 run_step 'plugin manifest' "$LOCAL_TIMEOUT_SECONDS" check_manifest
 run_step 'shell checks' "$LOCAL_TIMEOUT_SECONDS" check_shell
 run_step 'private data scan' "$LOCAL_TIMEOUT_SECONDS" check_private_data

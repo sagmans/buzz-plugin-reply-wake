@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast repo checks (JS syntax, manifest, shell lint, private-data guard) on
+# Fast repo checks (JS syntax, Biome, manifest, shell lint, private-data guard) on
 # exactly what is being committed. The staged index is exported to a temporary
 # tree, so a partly staged file is judged by its staged half and `commit -a`
 # or `commit <paths>` are judged by the index git chose.

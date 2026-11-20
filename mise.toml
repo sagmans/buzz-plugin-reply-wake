@@ -1,0 +1,8 @@
+# Tools for this repository. Run them through mise (`mise exec -- …`), so
+# every machine runs checks with the same releases.
+[tools]
+node = "24.22.3"
+biome = "2.5.14"
+markdownlint-cli2 = "0.24.1"
+shfmt = "3.14.1"
+"pipx:lizard" = "1.24.3"
